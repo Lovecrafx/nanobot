@@ -107,12 +107,55 @@ class TestMessageToolSuppressLogic:
         async def on_progress(content: str, *, tool_hint: bool = False) -> None:
             progress.append((content, tool_hint))
 
-        final_content, _, _ = await loop._run_agent_loop([], on_progress=on_progress)
+        final_content, _, _, _, _ = await loop._run_agent_loop([], on_progress=on_progress)
 
         assert final_content == "Done"
         assert progress == [
             ("Visible", False),
             ('read_file("foo.txt")', True),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_telegram_stream_clears_tool_turn_preview_and_tags_final(self, tmp_path: Path) -> None:
+        loop = _make_loop(tmp_path)
+        tool_call = ToolCallRequest(id="call1", name="read_file", arguments={"path": "foo.txt"})
+        call_index = 0
+
+        async def _chat(*args, **kwargs):
+            nonlocal call_index
+            call_index += 1
+            if call_index == 1:
+                await kwargs["on_text_stream"]("draft output " * 3)
+                return LLMResponse(content="Visible", tool_calls=[tool_call])
+            await kwargs["on_text_stream"]("final output " * 3)
+            return LLMResponse(content="Done", tool_calls=[])
+
+        loop.provider.chat = AsyncMock(side_effect=_chat)
+        loop.tools.get_definitions = MagicMock(return_value=[])
+        loop.tools.execute = AsyncMock(return_value="ok")
+
+        msg = InboundMessage(channel="telegram", sender_id="user1", chat_id="chat123", content="Hi")
+        result = await loop._process_message(msg)
+
+        outbound: list[OutboundMessage] = []
+        while loop.bus.outbound_size:
+            outbound.append(await loop.bus.consume_outbound())
+
+        assert result is not None
+        assert isinstance(result.metadata.get("_stream_id"), str)
+        assert [
+            (
+                item.metadata.get("_progress_kind"),
+                item.metadata.get("_stream_op"),
+                item.content,
+            )
+            for item in outbound
+        ] == [
+            ("assistant_stream", "update", "draft output draft output draft output"),
+            ("assistant_stream", "clear", ""),
+            (None, None, "Visible"),
+            (None, None, 'read_file("foo.txt")'),
+            ("assistant_stream", "update", "final output final output final output"),
         ]
 
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-from typing import Any, AsyncGenerator
+from typing import Any, AsyncGenerator, Awaitable, Callable
 
 import httpx
 from loguru import logger
@@ -32,6 +32,7 @@ class OpenAICodexProvider(LLMProvider):
         max_tokens: int = 4096,
         temperature: float = 0.7,
         reasoning_effort: str | None = None,
+        on_text_stream: Callable[[str], Awaitable[None]] | None = None,
     ) -> LLMResponse:
         model = model or self.default_model
         system_prompt, input_items = _convert_messages(messages)
@@ -62,12 +63,16 @@ class OpenAICodexProvider(LLMProvider):
 
         try:
             try:
-                content, tool_calls, finish_reason = await _request_codex(url, headers, body, verify=True)
+                content, tool_calls, finish_reason = await _request_codex(
+                    url, headers, body, verify=True, on_text_stream=on_text_stream,
+                )
             except Exception as e:
                 if "CERTIFICATE_VERIFY_FAILED" not in str(e):
                     raise
                 logger.warning("SSL certificate verification failed for Codex API; retrying with verify=False")
-                content, tool_calls, finish_reason = await _request_codex(url, headers, body, verify=False)
+                content, tool_calls, finish_reason = await _request_codex(
+                    url, headers, body, verify=False, on_text_stream=on_text_stream,
+                )
             return LLMResponse(
                 content=content,
                 tool_calls=tool_calls,
@@ -106,13 +111,14 @@ async def _request_codex(
     headers: dict[str, str],
     body: dict[str, Any],
     verify: bool,
+    on_text_stream: Callable[[str], Awaitable[None]] | None = None,
 ) -> tuple[str, list[ToolCallRequest], str]:
     async with httpx.AsyncClient(timeout=60.0, verify=verify) as client:
         async with client.stream("POST", url, headers=headers, json=body) as response:
             if response.status_code != 200:
                 text = await response.aread()
                 raise RuntimeError(_friendly_error(response.status_code, text.decode("utf-8", "ignore")))
-            return await _consume_sse(response)
+            return await _consume_sse(response, on_text_stream=on_text_stream)
 
 
 def _convert_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -231,7 +237,7 @@ async def _iter_sse(response: httpx.Response) -> AsyncGenerator[dict[str, Any], 
     async for line in response.aiter_lines():
         if line == "":
             if buffer:
-                data_lines = [l[5:].strip() for l in buffer if l.startswith("data:")]
+                data_lines = [line_item[5:].strip() for line_item in buffer if line_item.startswith("data:")]
                 buffer = []
                 if not data_lines:
                     continue
@@ -246,7 +252,10 @@ async def _iter_sse(response: httpx.Response) -> AsyncGenerator[dict[str, Any], 
         buffer.append(line)
 
 
-async def _consume_sse(response: httpx.Response) -> tuple[str, list[ToolCallRequest], str]:
+async def _consume_sse(
+    response: httpx.Response,
+    on_text_stream: Callable[[str], Awaitable[None]] | None = None,
+) -> tuple[str, list[ToolCallRequest], str]:
     content = ""
     tool_calls: list[ToolCallRequest] = []
     tool_call_buffers: dict[str, dict[str, Any]] = {}
@@ -267,6 +276,8 @@ async def _consume_sse(response: httpx.Response) -> tuple[str, list[ToolCallRequ
                 }
         elif event_type == "response.output_text.delta":
             content += event.get("delta") or ""
+            if on_text_stream and content:
+                await on_text_stream(content)
         elif event_type == "response.function_call_arguments.delta":
             call_id = event.get("call_id")
             if call_id and call_id in tool_call_buffers:

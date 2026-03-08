@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import re
-import time
 import unicodedata
+from dataclasses import dataclass
 
 from loguru import logger
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, ReplyParameters, Update
@@ -28,6 +28,17 @@ from nanobot.config.schema import TelegramConfig
 from nanobot.utils.helpers import split_message
 
 TELEGRAM_MAX_MESSAGE_LEN = 4000  # Telegram message character limit
+_DRAFT_API_UNAVAILABLE_RE = re.compile(r"(unknown method|not (found|available|supported)|unsupported)", re.I)
+_DRAFT_CHAT_UNSUPPORTED_RE = re.compile(r"(can't be used|can be used only)", re.I)
+
+
+@dataclass
+class _TelegramPreviewState:
+    transport: str
+    draft_id: int | None = None
+    message_id: int | None = None
+    last_text: str = ""
+    last_parse_mode: str | None = None
 
 
 def _strip_md(s: str) -> str:
@@ -190,6 +201,8 @@ class TelegramChannel(BaseChannel):
         self._media_group_buffers: dict[str, dict] = {}
         self._media_group_tasks: dict[str, asyncio.Task] = {}
         self._message_threads: dict[tuple[str, int], int] = {}
+        self._preview_states: dict[tuple[str, str], _TelegramPreviewState] = {}
+        self._next_draft_id = 0
 
     def is_allowed(self, sender_id: str) -> bool:
         """Preserve Telegram's legacy id|username allowlist matching."""
@@ -338,6 +351,18 @@ class TelegramChannel(BaseChannel):
                     allow_sending_without_reply=True
                 )
 
+        if msg.metadata.get("_progress_kind") == "assistant_stream":
+            await self._handle_stream_progress(msg, chat_id, reply_params, thread_kwargs)
+            return
+
+        stream_key = self._preview_key(msg)
+        preview_state = self._preview_states.get(stream_key) if stream_key else None
+        if preview_state and preview_state.transport == "message":
+            if await self._materialize_message_preview(
+                msg, chat_id, reply_params, thread_kwargs, stream_key, preview_state,
+            ):
+                return
+
         # Send media files
         for media_path in (msg.media or []):
             try:
@@ -370,11 +395,13 @@ class TelegramChannel(BaseChannel):
             is_progress = msg.metadata.get("_progress", False)
 
             for chunk in split_message(msg.content, TELEGRAM_MAX_MESSAGE_LEN):
-                # Final response: simulate streaming via draft, then persist
                 if not is_progress:
-                    await self._send_with_streaming(chat_id, chunk, reply_params, thread_kwargs)
+                    await self._send_text(chat_id, chunk, reply_params, thread_kwargs)
                 else:
                     await self._send_text(chat_id, chunk, reply_params, thread_kwargs)
+
+        if stream_key:
+            await self._clear_preview(stream_key, chat_id, thread_kwargs, delete_message=False)
 
     async def _send_text(
         self,
@@ -403,29 +430,226 @@ class TelegramChannel(BaseChannel):
             except Exception as e2:
                 logger.error("Error sending Telegram message: {}", e2)
 
-    async def _send_with_streaming(
+    def _preview_key(self, msg: OutboundMessage) -> tuple[str, str] | None:
+        stream_id = msg.metadata.get("_stream_id")
+        if not isinstance(stream_id, str) or not stream_id:
+            return None
+        return (msg.chat_id, stream_id)
+
+    def _allocate_draft_id(self) -> int:
+        self._next_draft_id = 1 if self._next_draft_id >= 2_147_483_647 else self._next_draft_id + 1
+        return self._next_draft_id
+
+    def _resolve_draft_api(self):
+        if not self._app:
+            return None
+        send_draft = getattr(self._app.bot, "send_message_draft", None)
+        if not callable(send_draft):
+            return None
+        return send_draft
+
+    @staticmethod
+    def _is_draft_transport_error(exc: Exception) -> bool:
+        text = str(exc)
+        if "sendMessageDraft" not in text and "send_message_draft" not in text:
+            return False
+        return bool(_DRAFT_API_UNAVAILABLE_RE.search(text) or _DRAFT_CHAT_UNSUPPORTED_RE.search(text))
+
+    @staticmethod
+    def _render_preview_text(text: str) -> tuple[str, str | None]:
+        return _markdown_to_telegram_html(text), "HTML"
+
+    async def _send_message_preview(
         self,
         chat_id: int,
         text: str,
-        reply_params=None,
-        thread_kwargs: dict | None = None,
-    ) -> None:
-        """Simulate streaming via send_message_draft, then persist with send_message."""
-        draft_id = int(time.time() * 1000) % (2**31)
+        reply_params,
+        thread_kwargs: dict | None,
+    ) -> int | None:
+        rendered_text, parse_mode = self._render_preview_text(text)
         try:
-            step = max(len(text) // 8, 40)
-            for i in range(step, len(text), step):
-                await self._app.bot.send_message_draft(
-                    chat_id=chat_id, draft_id=draft_id, text=text[:i],
-                )
-                await asyncio.sleep(0.04)
-            await self._app.bot.send_message_draft(
-                chat_id=chat_id, draft_id=draft_id, text=text,
+            sent = await self._app.bot.send_message(
+                chat_id=chat_id,
+                text=rendered_text,
+                parse_mode=parse_mode,
+                reply_parameters=reply_params,
+                **(thread_kwargs or {}),
             )
-            await asyncio.sleep(0.15)
         except Exception:
-            pass
-        await self._send_text(chat_id, text, reply_params, thread_kwargs)
+            sent = await self._app.bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                reply_parameters=reply_params,
+                **(thread_kwargs or {}),
+            )
+        message_id = getattr(sent, "message_id", None)
+        return int(message_id) if isinstance(message_id, int) else None
+
+    async def _edit_message_preview(
+        self,
+        chat_id: int,
+        message_id: int,
+        text: str,
+    ) -> bool:
+        rendered_text, parse_mode = self._render_preview_text(text)
+        try:
+            await self._app.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=rendered_text,
+                parse_mode=parse_mode,
+            )
+            return True
+        except Exception:
+            try:
+                await self._app.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=text,
+                )
+                return True
+            except Exception as e:
+                logger.warning("Telegram preview edit failed: {}", e)
+                return False
+
+    async def _send_draft_preview(
+        self,
+        chat_id: int,
+        state: _TelegramPreviewState,
+        text: str,
+        thread_kwargs: dict | None,
+    ) -> bool:
+        send_draft = self._resolve_draft_api()
+        if send_draft is None:
+            return False
+        rendered_text, parse_mode = self._render_preview_text(text)
+        params = dict(thread_kwargs or {})
+        if parse_mode:
+            params["parse_mode"] = parse_mode
+        try:
+            await send_draft(
+                chat_id=chat_id,
+                draft_id=state.draft_id,
+                text=rendered_text,
+                **params,
+            )
+            state.last_text = text
+            state.last_parse_mode = parse_mode
+            return True
+        except Exception as e:
+            if self._is_draft_transport_error(e):
+                logger.info("Telegram draft preview unavailable, falling back to message preview")
+                state.transport = "message"
+                state.draft_id = None
+                state.last_text = ""
+                state.last_parse_mode = None
+                return False
+            logger.warning("Telegram draft preview failed: {}", e)
+            raise
+
+    async def _handle_stream_progress(
+        self,
+        msg: OutboundMessage,
+        chat_id: int,
+        reply_params,
+        thread_kwargs: dict | None,
+    ) -> None:
+        key = self._preview_key(msg)
+        if key is None:
+            return
+        if msg.metadata.get("_stream_op") == "clear":
+            await self._clear_preview(key, chat_id, thread_kwargs, delete_message=True)
+            return
+        text = (msg.content or "").rstrip()
+        if not text:
+            return
+        if len(text) > TELEGRAM_MAX_MESSAGE_LEN:
+            await self._clear_preview(key, chat_id, thread_kwargs, delete_message=True)
+            return
+
+        state = self._preview_states.get(key)
+        if state is None:
+            use_draft = not msg.metadata.get("is_group", False) and self._resolve_draft_api() is not None
+            state = _TelegramPreviewState(
+                transport="draft" if use_draft else "message",
+                draft_id=self._allocate_draft_id() if use_draft else None,
+            )
+            self._preview_states[key] = state
+
+        if state.transport == "draft":
+            try:
+                sent = await self._send_draft_preview(chat_id, state, text, thread_kwargs)
+            except Exception:
+                self._preview_states.pop(key, None)
+                return
+            if sent:
+                return
+
+        if state.message_id is None:
+            message_id = await self._send_message_preview(chat_id, text, reply_params, thread_kwargs)
+            if message_id is None:
+                self._preview_states.pop(key, None)
+                return
+            state.message_id = message_id
+            state.last_text = text
+            state.last_parse_mode = "HTML"
+            return
+
+        if not await self._edit_message_preview(chat_id, state.message_id, text):
+            await self._clear_preview(key, chat_id, thread_kwargs, delete_message=True)
+            return
+        state.last_text = text
+        state.last_parse_mode = "HTML"
+
+    async def _clear_preview(
+        self,
+        key: tuple[str, str],
+        chat_id: int,
+        thread_kwargs: dict | None,
+        delete_message: bool,
+    ) -> None:
+        state = self._preview_states.pop(key, None)
+        if state is None or not self._app:
+            return
+        if state.transport == "draft" and state.draft_id is not None:
+            send_draft = self._resolve_draft_api()
+            if send_draft is not None:
+                try:
+                    await send_draft(
+                        chat_id=chat_id,
+                        draft_id=state.draft_id,
+                        text="",
+                        **(thread_kwargs or {}),
+                    )
+                except Exception:
+                    pass
+            return
+        if delete_message and state.message_id is not None:
+            try:
+                await self._app.bot.delete_message(chat_id=chat_id, message_id=state.message_id)
+            except Exception:
+                pass
+
+    async def _materialize_message_preview(
+        self,
+        msg: OutboundMessage,
+        chat_id: int,
+        reply_params,
+        thread_kwargs: dict | None,
+        key: tuple[str, str],
+        state: _TelegramPreviewState,
+    ) -> bool:
+        if not msg.content or msg.content == "[empty message]":
+            await self._clear_preview(key, chat_id, thread_kwargs, delete_message=True)
+            return True
+        if len(msg.content) > TELEGRAM_MAX_MESSAGE_LEN or state.message_id is None:
+            await self._clear_preview(key, chat_id, thread_kwargs, delete_message=True)
+            return False
+        if await self._edit_message_preview(chat_id, state.message_id, msg.content):
+            self._preview_states.pop(key, None)
+            return True
+        await self._clear_preview(key, chat_id, thread_kwargs, delete_message=True)
+        return False
 
     async def _on_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle /start command."""

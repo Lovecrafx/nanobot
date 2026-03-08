@@ -29,6 +29,10 @@ class _FakeUpdater:
 class _FakeBot:
     def __init__(self) -> None:
         self.sent_messages: list[dict] = []
+        self.edited_messages: list[dict] = []
+        self.draft_messages: list[dict] = []
+        self.deleted_messages: list[dict] = []
+        self._message_id = 100
 
     async def get_me(self):
         return SimpleNamespace(username="nanobot_test")
@@ -38,6 +42,17 @@ class _FakeBot:
 
     async def send_message(self, **kwargs) -> None:
         self.sent_messages.append(kwargs)
+        self._message_id += 1
+        return SimpleNamespace(message_id=self._message_id)
+
+    async def edit_message_text(self, **kwargs) -> None:
+        self.edited_messages.append(kwargs)
+
+    async def send_message_draft(self, **kwargs) -> None:
+        self.draft_messages.append(kwargs)
+
+    async def delete_message(self, **kwargs) -> None:
+        self.deleted_messages.append(kwargs)
 
 
 class _FakeApp:
@@ -186,6 +201,109 @@ async def test_send_reply_infers_topic_from_message_id_cache() -> None:
 
     assert channel._app.bot.sent_messages[0]["message_thread_id"] == 42
     assert channel._app.bot.sent_messages[0]["reply_parameters"].message_id == 10
+
+
+@pytest.mark.asyncio
+async def test_stream_progress_private_chat_uses_draft_and_clears_on_final() -> None:
+    channel = TelegramChannel(TelegramConfig(enabled=True, token="123:abc", allow_from=["*"]), MessageBus())
+    channel._app = _FakeApp(lambda: None)
+
+    await channel.send(
+        OutboundMessage(
+            channel="telegram",
+            chat_id="123",
+            content="hello",
+            metadata={
+                "_progress": True,
+                "_progress_kind": "assistant_stream",
+                "_stream_op": "update",
+                "_stream_id": "stream1",
+                "is_group": False,
+            },
+        )
+    )
+    await channel.send(
+        OutboundMessage(
+            channel="telegram",
+            chat_id="123",
+            content="hello world",
+            metadata={"_stream_id": "stream1", "is_group": False},
+        )
+    )
+
+    assert channel._app.bot.draft_messages[0]["text"] == "hello"
+    assert channel._app.bot.sent_messages[0]["text"] == "hello world"
+    assert channel._app.bot.draft_messages[-1]["text"] == ""
+
+
+@pytest.mark.asyncio
+async def test_stream_progress_group_chat_materializes_by_editing_message() -> None:
+    channel = TelegramChannel(TelegramConfig(enabled=True, token="123:abc", allow_from=["*"]), MessageBus())
+    channel._app = _FakeApp(lambda: None)
+
+    await channel.send(
+        OutboundMessage(
+            channel="telegram",
+            chat_id="123",
+            content="hello",
+            metadata={
+                "_progress": True,
+                "_progress_kind": "assistant_stream",
+                "_stream_op": "update",
+                "_stream_id": "stream2",
+                "is_group": True,
+            },
+        )
+    )
+    await channel.send(
+        OutboundMessage(
+            channel="telegram",
+            chat_id="123",
+            content="hello world",
+            metadata={"_stream_id": "stream2", "is_group": True},
+        )
+    )
+
+    assert len(channel._app.bot.sent_messages) == 1
+    assert channel._app.bot.sent_messages[0]["text"] == "hello"
+    assert channel._app.bot.edited_messages[-1]["text"] == "hello world"
+
+
+@pytest.mark.asyncio
+async def test_stream_clear_deletes_message_preview() -> None:
+    channel = TelegramChannel(TelegramConfig(enabled=True, token="123:abc", allow_from=["*"]), MessageBus())
+    channel._app = _FakeApp(lambda: None)
+
+    await channel.send(
+        OutboundMessage(
+            channel="telegram",
+            chat_id="123",
+            content="hello",
+            metadata={
+                "_progress": True,
+                "_progress_kind": "assistant_stream",
+                "_stream_op": "update",
+                "_stream_id": "stream3",
+                "is_group": True,
+            },
+        )
+    )
+    await channel.send(
+        OutboundMessage(
+            channel="telegram",
+            chat_id="123",
+            content="",
+            metadata={
+                "_progress": True,
+                "_progress_kind": "assistant_stream",
+                "_stream_op": "clear",
+                "_stream_id": "stream3",
+                "is_group": True,
+            },
+        )
+    )
+
+    assert channel._app.bot.deleted_messages[0]["chat_id"] == 123
 
 
 @pytest.mark.asyncio

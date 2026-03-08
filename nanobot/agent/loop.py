@@ -7,6 +7,8 @@ import inspect
 import json
 import math
 import re
+import time
+import uuid
 import weakref
 from contextlib import AsyncExitStack
 from pathlib import Path
@@ -58,6 +60,8 @@ class AgentLoop:
     _COMPACTIONS_KEY = "compactions"
     _CONTEXT_WINDOW_TOKENS = 200_000
     _IMAGE_TOKEN_COST = 256
+    _TELEGRAM_STREAM_THROTTLE_SEC = 1.0
+    _TELEGRAM_STREAM_MIN_INITIAL_CHARS = 32
     _HELP_TEXT = (
         "🐈 nanobot commands:\n"
         "/new — Start a new conversation\n"
@@ -377,29 +381,66 @@ class AgentLoop:
         initial_messages: list[dict],
         task_text: str | None = None,
         on_progress: Callable[..., Awaitable[None]] | None = None,
-    ) -> tuple[str | None, list[str], list[dict], dict[str, Any]]:
-        """Run the agent iteration loop. Returns (final_content, tools_used, messages, turn_stats)."""
+        on_stream_event: Callable[[str, str, str | None], Awaitable[None]] | None = None,
+    ) -> tuple[str | None, list[str], list[dict], dict[str, Any], str | None]:
+        """Run the agent iteration loop. Returns (final_content, tools_used, messages, turn_stats, final_stream_id)."""
         messages = initial_messages
         iteration = 0
         final_content = None
         tools_used: list[str] = []
         resolved_reasoning = self._resolve_reasoning_effort(task_text)
         turn_stats = self._make_turn_stats(resolved_reasoning)
+        final_stream_id: str | None = None
 
         while iteration < self.max_iterations:
             iteration += 1
+            stream_id = uuid.uuid4().hex if on_stream_event else None
+            pending_snapshot: str | None = None
+            last_sent_snapshot: str | None = None
+            last_emit_at = 0.0
+            preview_visible = False
 
-            response = await self.provider.chat(
-                messages=messages,
-                tools=self.tools.get_definitions(),
-                model=self.model,
-                temperature=self.temperature,
-                max_tokens=self.max_tokens,
-                reasoning_effort=resolved_reasoning,
-            )
+            async def _emit_snapshot(force: bool = False) -> None:
+                nonlocal last_sent_snapshot, last_emit_at, preview_visible
+                if not stream_id or not on_stream_event or not pending_snapshot:
+                    return
+                snapshot = pending_snapshot.strip()
+                if not snapshot or snapshot == last_sent_snapshot:
+                    return
+                if not preview_visible and len(snapshot) < self._TELEGRAM_STREAM_MIN_INITIAL_CHARS:
+                    return
+                now = time.monotonic()
+                if not force and now - last_emit_at < self._TELEGRAM_STREAM_THROTTLE_SEC:
+                    return
+                await on_stream_event(stream_id, "update", snapshot)
+                last_sent_snapshot = snapshot
+                last_emit_at = now
+                preview_visible = True
+
+            async def _provider_stream(snapshot: str) -> None:
+                nonlocal pending_snapshot
+                pending_snapshot = snapshot
+                await _emit_snapshot(force=False)
+
+            try:
+                response = await self.provider.chat(
+                    messages=messages,
+                    tools=self.tools.get_definitions(),
+                    model=self.model,
+                    temperature=self.temperature,
+                    max_tokens=self.max_tokens,
+                    reasoning_effort=resolved_reasoning,
+                    on_text_stream=_provider_stream if stream_id else None,
+                )
+            except asyncio.CancelledError:
+                if stream_id and preview_visible and on_stream_event:
+                    await on_stream_event(stream_id, "clear", None)
+                raise
             self._record_call_stats(turn_stats, messages, response)
 
             if response.has_tool_calls:
+                if stream_id and preview_visible and on_stream_event:
+                    await on_stream_event(stream_id, "clear", None)
                 if on_progress:
                     thought = self._strip_think(response.content)
                     if thought:
@@ -432,10 +473,14 @@ class AgentLoop:
                         messages, tool_call.id, tool_call.name, result
                     )
             else:
+                if response.finish_reason != "error":
+                    await _emit_snapshot(force=True)
                 clean = self._strip_think(response.content)
                 # Don't persist error responses to session history — they can
                 # poison the context and cause permanent 400 loops (#1303).
                 if response.finish_reason == "error":
+                    if stream_id and preview_visible and on_stream_event:
+                        await on_stream_event(stream_id, "clear", None)
                     logger.error("LLM returned error: {}", (clean or "")[:200])
                     final_content = clean or "Sorry, I encountered an error calling the AI model."
                     break
@@ -444,6 +489,7 @@ class AgentLoop:
                     thinking_blocks=response.thinking_blocks,
                 )
                 final_content = clean
+                final_stream_id = stream_id
                 turn_stats["completed"] = True
                 break
 
@@ -455,7 +501,7 @@ class AgentLoop:
             )
             turn_stats["completed"] = True
 
-        return final_content, tools_used, messages, turn_stats
+        return final_content, tools_used, messages, turn_stats, final_stream_id
 
     async def run(self) -> None:
         """Run the agent loop, dispatching messages as tasks to stay responsive to /stop."""
@@ -548,7 +594,7 @@ class AgentLoop:
                 history=history,
                 current_message=msg.content, channel=channel, chat_id=chat_id,
             )
-            final_content, _, all_msgs, turn_stats = await self._run_agent_loop(messages, task_text=msg.content)
+            final_content, _, all_msgs, turn_stats, _ = await self._run_agent_loop(messages, task_text=msg.content)
             self._save_turn(session, all_msgs, 1 + len(history))
             if turn_stats.get("completed"):
                 self._save_turn_status(session, turn_stats)
@@ -675,8 +721,21 @@ class AgentLoop:
                 channel=msg.channel, chat_id=msg.chat_id, content=content, metadata=meta,
             ))
 
-        final_content, _, all_msgs, turn_stats = await self._run_agent_loop(
-            initial_messages, task_text=msg.content, on_progress=on_progress or _bus_progress,
+        async def _bus_stream_event(stream_id: str, op: str, content: str | None) -> None:
+            meta = dict(msg.metadata or {})
+            meta["_progress"] = True
+            meta["_progress_kind"] = "assistant_stream"
+            meta["_stream_op"] = op
+            meta["_stream_id"] = stream_id
+            await self.bus.publish_outbound(OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id, content=content or "", metadata=meta,
+            ))
+
+        final_content, _, all_msgs, turn_stats, final_stream_id = await self._run_agent_loop(
+            initial_messages,
+            task_text=msg.content,
+            on_progress=on_progress or _bus_progress,
+            on_stream_event=_bus_stream_event if msg.channel == "telegram" else None,
         )
 
         if final_content is None:
@@ -692,9 +751,12 @@ class AgentLoop:
 
         preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
         logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
+        meta = dict(msg.metadata or {})
+        if final_stream_id:
+            meta["_stream_id"] = final_stream_id
         return OutboundMessage(
             channel=msg.channel, chat_id=msg.chat_id, content=final_content,
-            metadata=msg.metadata or {},
+            metadata=meta,
         )
 
     def _save_turn(self, session: Session, messages: list[dict], skip: int) -> None:
