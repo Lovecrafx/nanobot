@@ -120,6 +120,32 @@ class TestMemoryConsolidationTypeHandling:
         assert "User discussed testing." in store.history_file.read_text()
 
     @pytest.mark.asyncio
+    async def test_instructions_are_included_in_prompt(self, tmp_path: Path) -> None:
+        """Compaction instructions should be forwarded into the consolidation prompt."""
+        store = MemoryStore(tmp_path)
+        provider = AsyncMock()
+        provider.chat = AsyncMock(
+            return_value=_make_tool_response(
+                history_entry="[2026-01-01] User discussed testing.",
+                memory_update="# Memory\nUser likes testing.",
+            )
+        )
+        session = _make_session(message_count=60)
+
+        result = await store.consolidate(
+            session,
+            provider,
+            "test-model",
+            memory_window=50,
+            instructions="保留 TODO 与决策",
+        )
+
+        assert result is True
+        prompt = provider.chat.await_args.kwargs["messages"][1]["content"]
+        assert "## Compaction Instructions" in prompt
+        assert "保留 TODO 与决策" in prompt
+
+    @pytest.mark.asyncio
     async def test_no_tool_call_returns_false(self, tmp_path: Path) -> None:
         """When LLM doesn't use the save_memory tool, return False."""
         store = MemoryStore(tmp_path)

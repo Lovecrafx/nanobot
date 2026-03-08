@@ -172,6 +172,7 @@ async def test_help_mentions_think() -> None:
 
     assert "/think — Set default reasoning level" in response.content
     assert "/status — Show current session status" in response.content
+    assert "/compact — Compact current session context" in response.content
     assert "/restart — Restart the gateway" in response.content
 
 
@@ -324,6 +325,94 @@ async def test_consolidate_memory_increments_compactions_only_on_success() -> No
         mock_store.return_value.consolidate = AsyncMock(return_value=False)
         assert await loop._consolidate_memory(session) is False
         assert session.metadata["compactions"] == 1
+
+
+@pytest.mark.asyncio
+async def test_compact_command_compacts_session_and_returns_success() -> None:
+    session = Session(key="cli:c1")
+    for i in range(60):
+        session.add_message("user", f"msg{i}")
+    loop, _, sessions = _make_loop_with_session(session)
+
+    with patch.object(loop, "_consolidate_memory", AsyncMock(return_value=True)) as mock_compact:
+        response = await loop._process_message(
+            InboundMessage(channel="cli", sender_id="u1", chat_id="c1", content="/compact")
+        )
+
+    assert response.content == "compact success"
+    mock_compact.assert_awaited_once_with(session, instructions=None)
+    sessions.save.assert_called_once_with(session)
+
+
+@pytest.mark.asyncio
+async def test_compact_command_passes_instructions() -> None:
+    session = Session(key="cli:c1")
+    for i in range(60):
+        session.add_message("user", f"msg{i}")
+    loop, _, _ = _make_loop_with_session(session)
+
+    with patch.object(loop, "_consolidate_memory", AsyncMock(return_value=True)) as mock_compact:
+        response = await loop._process_message(
+            InboundMessage(channel="cli", sender_id="u1", chat_id="c1", content="/compact 保留 TODO 与决策")
+        )
+
+    assert response.content == "compact success"
+    mock_compact.assert_awaited_once_with(session, instructions="保留 TODO 与决策")
+
+
+@pytest.mark.asyncio
+async def test_compact_command_returns_noop_when_nothing_to_compact() -> None:
+    session = Session(key="cli:c1")
+    for i in range(10):
+        session.add_message("user", f"msg{i}")
+    loop, _, sessions = _make_loop_with_session(session)
+
+    with patch.object(loop, "_consolidate_memory", AsyncMock(return_value=True)) as mock_compact:
+        response = await loop._process_message(
+            InboundMessage(channel="cli", sender_id="u1", chat_id="c1", content="/compact")
+        )
+
+    assert response.content == "nothing to compact"
+    mock_compact.assert_not_awaited()
+    sessions.save.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_compact_command_returns_in_progress_when_session_is_compacting() -> None:
+    session = Session(key="cli:c1")
+    for i in range(60):
+        session.add_message("user", f"msg{i}")
+    loop, _, sessions = _make_loop_with_session(session)
+    loop._consolidating.add(session.key)
+
+    with patch.object(loop, "_consolidate_memory", AsyncMock(return_value=True)) as mock_compact:
+        response = await loop._process_message(
+            InboundMessage(channel="cli", sender_id="u1", chat_id="c1", content="/compact")
+        )
+
+    assert response.content == "compact in progress"
+    mock_compact.assert_not_awaited()
+    sessions.save.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_compact_command_returns_failed_when_consolidation_fails() -> None:
+    session = Session(key="cli:c1")
+    for i in range(60):
+        session.add_message("user", f"msg{i}")
+    session.last_consolidated = 5
+    original_last_consolidated = session.last_consolidated
+    loop, _, sessions = _make_loop_with_session(session)
+
+    with patch.object(loop, "_consolidate_memory", AsyncMock(return_value=False)) as mock_compact:
+        response = await loop._process_message(
+            InboundMessage(channel="cli", sender_id="u1", chat_id="c1", content="/compact")
+        )
+
+    assert response.content == "compact failed"
+    assert session.last_consolidated == original_last_consolidated
+    mock_compact.assert_awaited_once_with(session, instructions=None)
+    sessions.save.assert_not_called()
 
 
 @pytest.mark.asyncio

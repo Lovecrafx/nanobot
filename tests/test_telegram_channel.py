@@ -129,7 +129,7 @@ async def test_start_uses_request_proxy_without_builder_proxy(monkeypatch) -> No
     assert _FakeHTTPXRequest.instances[0].kwargs["proxy"] == config.proxy
     assert builder.request_value is _FakeHTTPXRequest.instances[0]
     assert builder.get_updates_request_value is _FakeHTTPXRequest.instances[0]
-    assert [cmd.command for cmd in app.bot.commands] == ["start", "new", "stop", "help", "think", "status", "restart"]
+    assert [cmd.command for cmd in app.bot.commands] == ["start", "new", "stop", "help", "think", "status", "compact", "restart"]
     assert app.updater.kwargs["allowed_updates"] == ["message", "callback_query"]
 
 
@@ -419,3 +419,4 @@ async def test_help_mentions_status() -> None:
     await channel._on_help(update, SimpleNamespace())
 
     assert "/status — Show current session status" in replies[0]
+    assert "/compact — Compact current session context" in replies[0]

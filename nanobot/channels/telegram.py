@@ -183,6 +183,7 @@ class TelegramChannel(BaseChannel):
         BotCommand("help", "Show available commands"),
         BotCommand("think", "Set default reasoning level"),
         BotCommand("status", "Show current session status"),
+        BotCommand("compact", "Compact current session context"),
         BotCommand("restart", "Restart the gateway"),
     ]
 
@@ -250,6 +251,7 @@ class TelegramChannel(BaseChannel):
         self._app.add_handler(CommandHandler("help", self._on_help))
         self._app.add_handler(CommandHandler("think", self._on_think))
         self._app.add_handler(CommandHandler("status", self._forward_command))
+        self._app.add_handler(CommandHandler("compact", self._forward_command))
         self._app.add_handler(CommandHandler("restart", self._forward_command))
         self._app.add_handler(CallbackQueryHandler(self._on_think_callback, pattern=r"^think:"))
 
@@ -674,6 +676,7 @@ class TelegramChannel(BaseChannel):
             "/help — Show available commands\n"
             "/think — Set default reasoning level\n"
             "/status — Show current session status\n"
+            "/compact — Compact current session context\n"
             "/restart — Restart the gateway"
         )
 

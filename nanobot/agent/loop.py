@@ -69,6 +69,7 @@ class AgentLoop:
         "/help — Show available commands\n"
         "/think — Set default reasoning level\n"
         "/status — Show current session status\n"
+        "/compact — Compact current session context\n"
         "/restart — Restart the gateway"
     )
 
@@ -163,6 +164,20 @@ class AgentLoop:
     def _restart_usage() -> str:
         """Return `/restart` usage text."""
         return "Usage: /restart"
+
+    @staticmethod
+    def _compact_usage() -> str:
+        """Return `/compact` usage text."""
+        return "Usage: /compact [instructions]"
+
+    def _can_compact_session(self, session: Session) -> bool:
+        """Return True when the session has old messages eligible for compaction."""
+        keep_count = self.memory_window // 2
+        if len(session.messages) <= keep_count:
+            return False
+        if len(session.messages) - session.last_consolidated <= 0:
+            return False
+        return bool(session.messages[session.last_consolidated:-keep_count])
 
     def _set_default_reasoning_effort(self, level: str | None) -> str:
         """Persist and apply the instance-level default reasoning effort."""
@@ -658,6 +673,44 @@ class AgentLoop:
             if arg:
                 return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=self._status_usage())
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=self._format_status(session))
+        if cmd == "/compact":
+            if session.key in self._consolidating:
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content="compact in progress",
+                )
+            if not self._can_compact_session(session):
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content="nothing to compact",
+                )
+            lock = self._consolidation_locks.setdefault(session.key, asyncio.Lock())
+            self._consolidating.add(session.key)
+            try:
+                async with lock:
+                    if not await self._consolidate_memory(session, instructions=arg or None):
+                        return OutboundMessage(
+                            channel=msg.channel,
+                            chat_id=msg.chat_id,
+                            content="compact failed",
+                        )
+            except Exception:
+                logger.exception("/compact failed for {}", session.key)
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content="compact failed",
+                )
+            finally:
+                self._consolidating.discard(session.key)
+            self.sessions.save(session)
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content="compact success",
+            )
         if cmd == "/restart":
             if arg:
                 return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=self._restart_usage())
@@ -794,11 +847,16 @@ class AgentLoop:
             session.messages.append(entry)
         session.updated_at = datetime.now()
 
-    async def _consolidate_memory(self, session, archive_all: bool = False) -> bool:
+    async def _consolidate_memory(
+        self,
+        session,
+        archive_all: bool = False,
+        instructions: str | None = None,
+    ) -> bool:
         """Delegate to MemoryStore.consolidate(). Returns True on success."""
         ok = await MemoryStore(self.workspace).consolidate(
             session, self.provider, self.model,
-            archive_all=archive_all, memory_window=self.memory_window,
+            archive_all=archive_all, memory_window=self.memory_window, instructions=instructions,
         )
         if ok:
             session.metadata[self._COMPACTIONS_KEY] = self._compaction_count(session) + 1

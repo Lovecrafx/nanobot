@@ -74,6 +74,7 @@ class MemoryStore:
         *,
         archive_all: bool = False,
         memory_window: int = 50,
+        instructions: str | None = None,
     ) -> bool:
         """Consolidate old messages into MEMORY.md + HISTORY.md via LLM tool call.
 
@@ -102,13 +103,17 @@ class MemoryStore:
             lines.append(f"[{m.get('timestamp', '?')[:16]}] {m['role'].upper()}{tools}: {m['content']}")
 
         current_memory = self.read_long_term()
+        instructions_block = ""
+        if instructions:
+            instructions_block = f"\n\n## Compaction Instructions\n{instructions}"
+
         prompt = f"""Process this conversation and call the save_memory tool with your consolidation.
 
 ## Current Long-term Memory
 {current_memory or "(empty)"}
 
 ## Conversation to Process
-{chr(10).join(lines)}"""
+{chr(10).join(lines)}{instructions_block}"""
 
         try:
             response = await provider.chat(
