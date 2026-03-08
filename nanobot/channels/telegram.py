@@ -8,10 +8,18 @@ import time
 import unicodedata
 
 from loguru import logger
-from telegram import BotCommand, ReplyParameters, Update
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, ReplyParameters, Update
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 from telegram.request import HTTPXRequest
 
+from nanobot.agent.reasoning import VALID_REASONING_LEVELS
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
@@ -162,6 +170,9 @@ class TelegramChannel(BaseChannel):
         BotCommand("new", "Start a new conversation"),
         BotCommand("stop", "Stop the current task"),
         BotCommand("help", "Show available commands"),
+        BotCommand("think", "Set default reasoning level"),
+        BotCommand("status", "Show current session status"),
+        BotCommand("restart", "Restart the gateway"),
     ]
 
     def __init__(
@@ -224,6 +235,10 @@ class TelegramChannel(BaseChannel):
         self._app.add_handler(CommandHandler("new", self._forward_command))
         self._app.add_handler(CommandHandler("stop", self._forward_command))
         self._app.add_handler(CommandHandler("help", self._on_help))
+        self._app.add_handler(CommandHandler("think", self._on_think))
+        self._app.add_handler(CommandHandler("status", self._forward_command))
+        self._app.add_handler(CommandHandler("restart", self._forward_command))
+        self._app.add_handler(CallbackQueryHandler(self._on_think_callback, pattern=r"^think:"))
 
         # Add message handler for text, photos, voice, documents
         self._app.add_handler(
@@ -252,7 +267,7 @@ class TelegramChannel(BaseChannel):
 
         # Start polling (this runs until stopped)
         await self._app.updater.start_polling(
-            allowed_updates=["message"],
+            allowed_updates=["message", "callback_query"],
             drop_pending_updates=True  # Ignore old messages on startup
         )
 
@@ -432,7 +447,55 @@ class TelegramChannel(BaseChannel):
             "🐈 nanobot commands:\n"
             "/new — Start a new conversation\n"
             "/stop — Stop the current task\n"
-            "/help — Show available commands"
+            "/help — Show available commands\n"
+            "/think — Set default reasoning level\n"
+            "/status — Show current session status\n"
+            "/restart — Restart the gateway"
+        )
+
+    @staticmethod
+    def _build_think_keyboard() -> InlineKeyboardMarkup:
+        """Build the inline keyboard for `/think`."""
+        rows = [
+            [
+                InlineKeyboardButton(level, callback_data=f"think:{level}")
+                for level in VALID_REASONING_LEVELS[idx:idx + 3]
+            ]
+            for idx in range(0, len(VALID_REASONING_LEVELS), 3)
+        ]
+        return InlineKeyboardMarkup(rows)
+
+    async def _on_think(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle `/think` with inline buttons or forward explicit levels."""
+        if not update.message or not update.effective_user:
+            return
+        if context.args:
+            await self._forward_command(update, context)
+            return
+        await update.message.reply_text(
+            "Choose the default reasoning level:",
+            reply_markup=self._build_think_keyboard(),
+        )
+
+    async def _on_think_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle `/think` inline button presses."""
+        query = update.callback_query
+        user = update.effective_user
+        if not query or not user or not query.message:
+            return
+        await query.answer()
+        level = (query.data or "").split(":", 1)[1] if ":" in (query.data or "") else ""
+        if level not in VALID_REASONING_LEVELS:
+            return
+        message = query.message
+        self._remember_thread_context(message)
+        self._start_typing(str(message.chat_id))
+        await self._handle_message(
+            sender_id=self._sender_id(user),
+            chat_id=str(message.chat_id),
+            content=f"/think {level}",
+            metadata=self._build_message_metadata(message, user),
+            session_key=self._derive_topic_session_key(message),
         )
 
     @staticmethod

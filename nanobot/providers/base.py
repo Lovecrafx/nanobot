@@ -22,7 +22,7 @@ class LLMResponse:
     usage: dict[str, int] = field(default_factory=dict)
     reasoning_content: str | None = None  # Kimi, DeepSeek-R1 etc.
     thinking_blocks: list[dict] | None = None  # Anthropic extended thinking
-    
+
     @property
     def has_tool_calls(self) -> bool:
         """Check if response contains tool calls."""
@@ -32,7 +32,7 @@ class LLMResponse:
 class LLMProvider(ABC):
     """
     Abstract base class for LLM providers.
-    
+
     Implementations should handle the specifics of each provider's API
     while maintaining a consistent interface.
     """
@@ -101,6 +101,28 @@ class LLMProvider(ABC):
             sanitized.append(clean)
         return sanitized
 
+    @staticmethod
+    def _extract_cached_tokens(usage: Any) -> int:
+        """Extract cached prompt tokens from common OpenAI-compatible usage shapes."""
+        if usage is None:
+            return 0
+
+        def _read(obj: Any, key: str) -> Any:
+            if isinstance(obj, dict):
+                return obj.get(key)
+            return getattr(obj, key, None)
+
+        for details_key in ("prompt_tokens_details", "input_tokens_details"):
+            details = _read(usage, details_key)
+            cached = _read(details, "cached_tokens")
+            if isinstance(cached, int):
+                return max(0, cached)
+
+        cached = _read(usage, "cached_tokens")
+        if isinstance(cached, int):
+            return max(0, cached)
+        return 0
+
     @abstractmethod
     async def chat(
         self,
@@ -113,14 +135,14 @@ class LLMProvider(ABC):
     ) -> LLMResponse:
         """
         Send a chat completion request.
-        
+
         Args:
             messages: List of message dicts with 'role' and 'content'.
             tools: Optional list of tool definitions.
             model: Model identifier (provider-specific).
             max_tokens: Maximum tokens in response.
             temperature: Sampling temperature.
-        
+
         Returns:
             LLMResponse with content and/or tool calls.
         """

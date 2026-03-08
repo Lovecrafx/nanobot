@@ -52,10 +52,14 @@ class CustomProvider(LLMProvider):
         u = response.usage
         return LLMResponse(
             content=msg.content, tool_calls=tool_calls, finish_reason=choice.finish_reason or "stop",
-            usage={"prompt_tokens": u.prompt_tokens, "completion_tokens": u.completion_tokens, "total_tokens": u.total_tokens} if u else {},
+            usage={
+                "prompt_tokens": u.prompt_tokens,
+                "completion_tokens": u.completion_tokens,
+                "total_tokens": u.total_tokens,
+                "cached_tokens": self._extract_cached_tokens(u),
+            } if u else {},
             reasoning_content=getattr(msg, "reasoning_content", None) or None,
         )
 
     def get_default_model(self) -> str:
         return self.default_model
-

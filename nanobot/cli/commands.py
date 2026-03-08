@@ -50,6 +50,67 @@ _PROMPT_SESSION: PromptSession | None = None
 _SAVED_TERM_ATTRS = None  # original termios settings, restored on exit
 
 
+class GatewayRuntime:
+    """Coordinate graceful gateway restart and process re-exec."""
+
+    _RESTART_DELAY_S = 0.25
+
+    def __init__(self) -> None:
+        self._restart_event = asyncio.Event()
+        self._restarting = False
+        self._restart_scheduled = False
+
+    @property
+    def restart_requested(self) -> bool:
+        """Whether a restart has been requested."""
+        return self._restart_event.is_set()
+
+    @property
+    def restarting(self) -> bool:
+        """Whether the gateway is already restarting."""
+        return self._restarting
+
+    def request_restart(self) -> bool:
+        """Schedule a gateway restart after the current response is sent."""
+        if self._restarting or self._restart_scheduled or self._restart_event.is_set():
+            return False
+        self._restart_scheduled = True
+        loop = asyncio.get_running_loop()
+        loop.call_later(self._RESTART_DELAY_S, self._restart_event.set)
+        return True
+
+    async def wait_for_restart(self) -> None:
+        """Block until restart is requested."""
+        await self._restart_event.wait()
+
+    async def shutdown(
+        self,
+        agent,
+        channels,
+        heartbeat,
+        cron,
+    ) -> None:
+        """Stop gateway services in a fixed order."""
+        self._restarting = True
+        await agent.close_mcp()
+        heartbeat.stop()
+        cron.stop()
+        agent.stop()
+        await channels.stop_all()
+
+    def exec_self(self) -> None:
+        """Replace the current process with a fresh gateway process."""
+        logger = None
+        try:
+            from loguru import logger as _logger
+            logger = _logger
+        except Exception:
+            pass
+        if logger:
+            logger.info("Re-executing gateway process: {}", sys.argv)
+        os.execv(sys.executable, [sys.executable, *sys.argv])
+
+
 def _flush_pending_tty_input() -> None:
     """Drop unread keypresses typed while the model was generating output."""
     try:
@@ -213,8 +274,8 @@ def onboard():
 
 def _make_provider(config: Config):
     """Create the appropriate LLM provider from config."""
-    from nanobot.providers.openai_codex_provider import OpenAICodexProvider
     from nanobot.providers.azure_openai_provider import AzureOpenAIProvider
+    from nanobot.providers.openai_codex_provider import OpenAICodexProvider
 
     model = config.agents.defaults.model
     provider_name = config.get_provider_name(model)
@@ -240,7 +301,7 @@ def _make_provider(config: Config):
             console.print("Set them in ~/.nanobot/config.json under providers.azure_openai section")
             console.print("Use the model field to specify the deployment name.")
             raise typer.Exit(1)
-        
+
         return AzureOpenAIProvider(
             api_key=p.api_key,
             api_base=p.api_base,
@@ -316,6 +377,7 @@ def gateway(
     bus = MessageBus()
     provider = _make_provider(config)
     session_manager = SessionManager(config.workspace_path)
+    runtime = GatewayRuntime()
 
     # Create cron service first (callback set after agent creation)
     cron_store_path = get_cron_dir() / "jobs.json"
@@ -340,6 +402,7 @@ def gateway(
         session_manager=session_manager,
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
+        restart_callback=runtime.request_restart,
     )
 
     # Set cron callback (needs agent)
@@ -449,21 +512,36 @@ def gateway(
     console.print(f"[green]✓[/green] Heartbeat: every {hb_cfg.interval_s}s")
 
     async def run():
+        restart_requested = False
         try:
             await cron.start()
             await heartbeat.start()
-            await asyncio.gather(
-                agent.run(),
-                channels.start_all(),
+            agent_task = asyncio.create_task(agent.run())
+            channels_task = asyncio.create_task(channels.start_all())
+            restart_task = asyncio.create_task(runtime.wait_for_restart())
+
+            done, pending = await asyncio.wait(
+                {agent_task, channels_task, restart_task},
+                return_when=asyncio.FIRST_COMPLETED,
             )
+            restart_requested = restart_task in done and runtime.restart_requested
+
+            for task in done:
+                if task is restart_task:
+                    continue
+                task.result()
+
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
         except KeyboardInterrupt:
             console.print("\nShutting down...")
         finally:
-            await agent.close_mcp()
-            heartbeat.stop()
-            cron.stop()
-            agent.stop()
-            await channels.stop_all()
+            await runtime.shutdown(agent, channels, heartbeat, cron)
+
+        if restart_requested:
+            console.print("[yellow]Restarting gateway...[/yellow]")
+            runtime.exec_self()
 
     asyncio.run(run())
 

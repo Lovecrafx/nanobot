@@ -19,8 +19,10 @@ class _FakeHTTPXRequest:
 class _FakeUpdater:
     def __init__(self, on_start_polling) -> None:
         self._on_start_polling = on_start_polling
+        self.kwargs = None
 
     async def start_polling(self, **kwargs) -> None:
+        self.kwargs = kwargs
         self._on_start_polling()
 
 
@@ -112,6 +114,8 @@ async def test_start_uses_request_proxy_without_builder_proxy(monkeypatch) -> No
     assert _FakeHTTPXRequest.instances[0].kwargs["proxy"] == config.proxy
     assert builder.request_value is _FakeHTTPXRequest.instances[0]
     assert builder.get_updates_request_value is _FakeHTTPXRequest.instances[0]
+    assert [cmd.command for cmd in app.bot.commands] == ["start", "new", "stop", "help", "think", "status", "restart"]
+    assert app.updater.kwargs["allowed_updates"] == ["message", "callback_query"]
 
 
 def test_derive_topic_session_key_uses_thread_id() -> None:
@@ -182,3 +186,118 @@ async def test_send_reply_infers_topic_from_message_id_cache() -> None:
 
     assert channel._app.bot.sent_messages[0]["message_thread_id"] == 42
     assert channel._app.bot.sent_messages[0]["reply_parameters"].message_id == 10
+
+
+@pytest.mark.asyncio
+async def test_on_think_without_args_shows_inline_keyboard() -> None:
+    channel = TelegramChannel(TelegramConfig(allow_from=["*"]), MessageBus())
+    calls: list[dict] = []
+
+    async def _reply_text(text: str, reply_markup=None) -> None:
+        calls.append({"text": text, "reply_markup": reply_markup})
+
+    update = SimpleNamespace(
+        message=SimpleNamespace(reply_text=_reply_text),
+        effective_user=SimpleNamespace(id=123),
+    )
+    context = SimpleNamespace(args=[])
+
+    await channel._on_think(update, context)
+
+    assert calls[0]["text"] == "Choose the default reasoning level:"
+    rows = calls[0]["reply_markup"].inline_keyboard
+    assert [[btn.text for btn in row] for row in rows] == [
+        ["off", "minimal", "low"],
+        ["medium", "high", "adaptive"],
+    ]
+    assert [[btn.callback_data for btn in row] for row in rows] == [
+        ["think:off", "think:minimal", "think:low"],
+        ["think:medium", "think:high", "think:adaptive"],
+    ]
+
+
+@pytest.mark.asyncio
+async def test_on_think_with_args_forwards_command(monkeypatch) -> None:
+    channel = TelegramChannel(TelegramConfig(allow_from=["*"]), MessageBus())
+    forwarded: list[tuple] = []
+
+    async def _forward(update, context) -> None:
+        forwarded.append((update, context))
+
+    monkeypatch.setattr(channel, "_forward_command", _forward)
+    update = SimpleNamespace(message=object(), effective_user=SimpleNamespace(id=123))
+    context = SimpleNamespace(args=["high"])
+
+    await channel._on_think(update, context)
+
+    assert forwarded == [(update, context)]
+
+
+@pytest.mark.asyncio
+async def test_on_think_callback_forwards_internal_command(monkeypatch) -> None:
+    channel = TelegramChannel(TelegramConfig(allow_from=["*"]), MessageBus())
+    handled: list[dict] = []
+    typing: list[str] = []
+
+    async def _handle_message(**kwargs) -> None:
+        handled.append(kwargs)
+
+    monkeypatch.setattr(channel, "_handle_message", _handle_message)
+    monkeypatch.setattr(channel, "_start_typing", lambda chat_id: typing.append(chat_id))
+
+    answered: list[bool] = []
+    message = SimpleNamespace(
+        chat_id=123,
+        message_id=77,
+        chat=SimpleNamespace(type="private", is_forum=False),
+        message_thread_id=None,
+    )
+    callback_query = SimpleNamespace(
+        data="think:adaptive",
+        message=message,
+        answer=lambda: answered.append(True),
+    )
+    update = SimpleNamespace(
+        callback_query=callback_query,
+        effective_user=SimpleNamespace(id=456, username="alice", first_name="Alice"),
+    )
+
+    async def _answer() -> None:
+        answered.append(True)
+
+    callback_query.answer = _answer
+
+    await channel._on_think_callback(update, SimpleNamespace())
+
+    assert answered == [True]
+    assert typing == ["123"]
+    assert handled == [{
+        "sender_id": "456|alice",
+        "chat_id": "123",
+        "content": "/think adaptive",
+        "metadata": {
+            "message_id": 77,
+            "user_id": 456,
+            "username": "alice",
+            "first_name": "Alice",
+            "is_group": False,
+            "message_thread_id": None,
+            "is_forum": False,
+        },
+        "session_key": None,
+    }]
+
+
+@pytest.mark.asyncio
+async def test_help_mentions_status() -> None:
+    channel = TelegramChannel(TelegramConfig(allow_from=["*"]), MessageBus())
+    replies: list[str] = []
+
+    async def _reply_text(text: str, reply_markup=None) -> None:
+        replies.append(text)
+
+    update = SimpleNamespace(message=SimpleNamespace(reply_text=_reply_text))
+
+    await channel._on_help(update, SimpleNamespace())
+
+    assert "/status — Show current session status" in replies[0]
